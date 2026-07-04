@@ -24,7 +24,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # 用于创建 Release 和上传附件
+      contents: write
 
     steps:
       - name: 安装构建依赖
@@ -50,8 +50,8 @@ jobs:
           ISO_VOLUME="${{ github.event.inputs.iso_volume }}"
           CUSTOM_PACKAGES="${{ github.event.inputs.custom_packages }}"
 
-          # 固定配置
-          MIRROR="https://mirrors.ustc.edu.cn/ubuntu"
+          # 固定配置（改用官方源，适应国外 CI 环境）
+          MIRROR="http://archive.ubuntu.com/ubuntu"
           BASE_VERSION="resolute"
           ARCH="amd64"
           BASE_PACKAGES="plymouth pipewire linux-generic"
@@ -63,11 +63,10 @@ jobs:
           KEYMAP="cn"
           AREAS="multiverse restricted universe"
 
-          # 清理旧目录
           sudo rm -rf chroot/ iso/
           mkdir -p chroot iso
 
-          # 第一阶段：debootstrap
+          # 第一阶段：debootstrap 使用官方源
           sudo /sbin/debootstrap --arch=${ARCH} ${BASE_VERSION} chroot ${MIRROR}
 
           # 确保 chroot 能联网
@@ -92,7 +91,7 @@ jobs:
           sudo mount --bind /proc chroot/proc
           sudo mount --bind /dev chroot/dev
 
-          # 启用 multiverse 等仓库
+          # 启用 multiverse 等仓库（sources.list 已由 debootstrap 生成）
           sudo sed -i "1s/$/ ${AREAS}/" chroot/etc/apt/sources.list
 
           # 第二阶段：安装软件包
@@ -118,18 +117,18 @@ jobs:
           LC_CTYPE=${LANG}.UTF-8
           EOF
 
-          # 设置时区和键盘布局（注意 timedatectl 和 localectl 在 chroot 内可能需要 D-Bus，忽略错误）
+          # 设置时区和键盘布局（忽略可能的 D-Bus 错误）
           sudo chroot chroot timedatectl set-timezone ${TIMEZONE} 2>/dev/null || true
           sudo chroot chroot localectl set-x11-keymap us,${KEYMAP} pc105 "" grp:win_space_toggle 2>/dev/null || true
 
-          # 启用/禁用服务（忽略不存在的服务）
+          # 启用/禁用服务
           for svc in ${ENABLED_SERVICES}; do sudo chroot chroot systemctl enable $svc 2>/dev/null || true; done
           for svc in ${DISABLED_SERVICES}; do sudo chroot chroot systemctl disable $svc 2>/dev/null || true; done
 
           # 准备 ISO 目录结构
           mkdir -p iso/boot/grub iso/casper
 
-          # 复制内核和 initrd（适配不同命名）
+          # 复制内核和 initrd
           sudo cp chroot/boot/vmlinuz-*generic iso/casper/vmlinuz 2>/dev/null || sudo cp chroot/boot/vmlinuz-* iso/casper/vmlinuz
           sudo cp chroot/boot/initrd.img-*generic iso/casper/initrd.img 2>/dev/null || sudo cp chroot/boot/initrd.img-* iso/casper/initrd.img
 
@@ -168,7 +167,7 @@ jobs:
           # 生成 ISO
           sudo grub-mkrescue -o ${ISO_NAME} -V "${ISO_VOLUME}" iso -iso-level 3 -J -R
 
-          # 修改文件所有者以便后续上传
+          # 修改文件所有者以便上传
           sudo chown $USER:$USER ${ISO_NAME}
 
       - name: 创建 Release
