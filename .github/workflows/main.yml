@@ -1,0 +1,193 @@
+name: Build Custom Ubuntu ISO
+
+on:
+  workflow_dispatch:
+    inputs:
+      os_name:
+        description: 'OS 名称（显示在 GRUB 菜单）'
+        required: true
+        default: 'AmeOS'
+      iso_name:
+        description: '输出的 ISO 文件名'
+        required: true
+        default: 'AmeOS.iso'
+      iso_volume:
+        description: 'ISO 卷标'
+        required: true
+        default: 'Ame'
+      custom_packages:
+        description: '额外安装的软件包（空格分隔）'
+        required: true
+        default: 'curl wget vim nano git fish'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # 用于创建 Release 和上传附件
+
+    steps:
+      - name: 安装构建依赖
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            debootstrap \
+            squashfs-tools \
+            grub-pc-bin \
+            grub-efi-amd64-bin \
+            xorriso \
+            mtools
+
+      - name: 生成构建时间戳（用作 Release Tag）
+        id: build_time
+        run: echo "time=$(date +'%Y%m%d%H%M%S')" >> $GITHUB_OUTPUT
+
+      - name: 构建 ISO
+        run: |
+          # 接收用户输入
+          OS_NAME="${{ github.event.inputs.os_name }}"
+          ISO_NAME="${{ github.event.inputs.iso_name }}"
+          ISO_VOLUME="${{ github.event.inputs.iso_volume }}"
+          CUSTOM_PACKAGES="${{ github.event.inputs.custom_packages }}"
+
+          # 固定配置
+          MIRROR="https://mirrors.ustc.edu.cn/ubuntu"
+          BASE_VERSION="resolute"
+          ARCH="amd64"
+          BASE_PACKAGES="plymouth pipewire linux-generic"
+          EXTRA_PACKAGES="ubuntu-desktop-minimal"
+          ENABLED_SERVICES=""
+          DISABLED_SERVICES=""
+          TIMEZONE="Asia/Shanghai"
+          LANG="zh_CN"
+          KEYMAP="cn"
+          AREAS="multiverse restricted universe"
+
+          # 清理旧目录
+          sudo rm -rf chroot/ iso/
+          mkdir -p chroot iso
+
+          # 第一阶段：debootstrap
+          sudo /sbin/debootstrap --arch=${ARCH} ${BASE_VERSION} chroot ${MIRROR}
+
+          # 确保 chroot 能联网
+          sudo cp /etc/resolv.conf chroot/etc/resolv.conf
+
+          # 禁用 snap 和 firefox snap 版本
+          sudo tee chroot/etc/apt/preferences.d/no-snapd.pref > /dev/null << "EOL"
+          Package: snapd
+          Pin: release a=*
+          Pin-Priority: -10
+          EOL
+          sudo tee chroot/etc/apt/preferences.d/no-firefox.pref > /dev/null << "EOL"
+          Package: firefox
+          Pin: release a=*
+          Pin-Priority: -10
+          EOL
+
+          # 挂载必要的系统目录
+          sudo mount --bind /run chroot/run
+          sudo mount --bind /sys chroot/sys
+          sudo mount --bind /tmp chroot/tmp
+          sudo mount --bind /proc chroot/proc
+          sudo mount --bind /dev chroot/dev
+
+          # 启用 multiverse 等仓库
+          sudo sed -i "1s/$/ ${AREAS}/" chroot/etc/apt/sources.list
+
+          # 第二阶段：安装软件包
+          sudo chroot chroot apt update
+          sudo chroot chroot apt install -y ${BASE_PACKAGES} ${EXTRA_PACKAGES} casper linux-generic
+          sudo chroot chroot apt update
+          sudo chroot chroot apt install -y ${CUSTOM_PACKAGES}
+
+          # 强制移除 snapd
+          sudo chroot chroot apt purge -y snapd 2>/dev/null || true
+          sudo chroot chroot apt autoremove --purge -y 2>/dev/null || true
+          sudo rm -rf chroot/snap chroot/var/snap chroot/var/lib/snapd chroot/var/cache/snapd
+
+          # 清理临时文件
+          sudo rm -rf chroot/boot/*.old chroot/var/cache/apt/* chroot/var/lib/systemd/random-seed chroot/etc/machine-id
+          sudo touch chroot/etc/machine-id
+
+          # 设置 locale
+          sudo tee chroot/etc/locale.conf > /dev/null << EOF
+          LANG=${LANG}.UTF-8
+          LC_TIME=${LANG}.UTF-8
+          LC_MESSAGES=${LANG}.UTF-8
+          LC_CTYPE=${LANG}.UTF-8
+          EOF
+
+          # 设置时区和键盘布局（注意 timedatectl 和 localectl 在 chroot 内可能需要 D-Bus，忽略错误）
+          sudo chroot chroot timedatectl set-timezone ${TIMEZONE} 2>/dev/null || true
+          sudo chroot chroot localectl set-x11-keymap us,${KEYMAP} pc105 "" grp:win_space_toggle 2>/dev/null || true
+
+          # 启用/禁用服务（忽略不存在的服务）
+          for svc in ${ENABLED_SERVICES}; do sudo chroot chroot systemctl enable $svc 2>/dev/null || true; done
+          for svc in ${DISABLED_SERVICES}; do sudo chroot chroot systemctl disable $svc 2>/dev/null || true; done
+
+          # 准备 ISO 目录结构
+          mkdir -p iso/boot/grub iso/casper
+
+          # 复制内核和 initrd（适配不同命名）
+          sudo cp chroot/boot/vmlinuz-*generic iso/casper/vmlinuz 2>/dev/null || sudo cp chroot/boot/vmlinuz-* iso/casper/vmlinuz
+          sudo cp chroot/boot/initrd.img-*generic iso/casper/initrd.img 2>/dev/null || sudo cp chroot/boot/initrd.img-* iso/casper/initrd.img
+
+          # 生成 GRUB 配置
+          sudo tee iso/boot/grub/grub.cfg > /dev/null << EOF
+          set timeout=30
+          loadfont unicode
+
+          menuentry "Try or Install ${OS_NAME}" {
+              set gfxpayload=keep
+              linux  /casper/vmlinuz boot=casper quiet splash
+              initrd /casper/initrd.img
+          }
+          menuentry "${OS_NAME} (safe graphics)" {
+              set gfxpayload=keep
+              linux  /casper/vmlinuz nomodeset boot=casper quiet splash
+              initrd /casper/initrd.img
+          }
+          grub_platform
+          if [ "\$grub_platform" = "efi" ]; then
+          menuentry 'Boot from next volume' {
+              exit 1
+          }
+          menuentry 'UEFI Firmware Settings' {
+              fwsetup
+          }
+          fi
+          EOF
+
+          # 卸载挂载点
+          sudo umount -l chroot/tmp chroot/run chroot/sys chroot/proc chroot/dev
+
+          # 创建 squashfs
+          sudo mksquashfs chroot iso/casper/filesystem.squashfs -comp xz -Xbcj x86 -b 1M -noappend
+
+          # 生成 ISO
+          sudo grub-mkrescue -o ${ISO_NAME} -V "${ISO_VOLUME}" iso -iso-level 3 -J -R
+
+          # 修改文件所有者以便后续上传
+          sudo chown $USER:$USER ${ISO_NAME}
+
+      - name: 创建 Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: "build-${{ steps.build_time.outputs.time }}"
+          release_name: "Build ${{ steps.build_time.outputs.time }}"
+          draft: false
+          prerelease: false
+
+      - name: 上传 ISO 到 Release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./${{ github.event.inputs.iso_name }}
+          asset_name: ${{ github.event.inputs.iso_name }}
+          asset_content_type: application/octet-stream
